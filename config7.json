@@ -4,6 +4,11 @@
     "port": 65007,
     "neighbors": [
         {
+            "id": 3,
+            "port": 65003,
+            "cost": 5
+        },
+        {
             "id": 4,
             "port": 65004,
             "cost": 4

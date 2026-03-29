@@ -18,6 +18,7 @@ class DynamicMulticastNode:
         self.neighbors = self.config.get('neighbors', [])
         
         self.peers = {} # Active TCP connections [cite: 55]
+        self.peer_costs = {} # To advertise link costs
         self.routing_table = {} # group -> list of next hops 
         self.parents = {} # group -> parent node id (for reverse path)
         self.seen_messages = set() # To prevent flooding loops
@@ -53,12 +54,13 @@ class DynamicMulticastNode:
 
     def connect_to_peers(self):
         for neighbor in self.neighbors:
-            peer_id, peer_port = neighbor['id'], neighbor['port']
+            peer_id, peer_port, peer_cost = neighbor['id'], neighbor['port'], neighbor['cost']
             for attempt in range(5):
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     sock.connect((self.host, peer_port))
                     self.peers[peer_id] = sock
+                    self.peer_costs[peer_id] = peer_cost
                     break
                 except ConnectionRefusedError:
                     time.sleep(1)
@@ -76,6 +78,7 @@ class DynamicMulticastNode:
         msg_type = message.get("type")
         group = message.get("group")
         sender = message.get("sender")
+        cost = message.get("cost")
 
         # Display received message content [cite: 61]
         if msg_type == "DATA":
@@ -85,20 +88,20 @@ class DynamicMulticastNode:
 
         # Process ANNOUNCE (Flooding to build reverse path)
         if msg_type == "ANNOUNCE":
-            if msg_id in self.seen_messages: return
-            self.seen_messages.add(msg_id)
-            
-            # Record the first node we heard the announcement from as our parent for this group
-            if group not in self.parents and self.role != 'S':
-                self.parents[group] = sender
-                print(f"[Node {self.node_id}] Set Node {sender} as parent for group {group}")
-                
-                # If I am a receiver, I need to send a JOIN up the tree
+            # Record message if its new
+            if msg_id not in self.seen_messages:
+                self.seen_messages.add(msg_id)
+                # If I'm a receiver, I need to wait until convergence then send a JOIN up the tree
                 if self.role == 'R':
-                    self.send_join(group)
-
-            # Forward the announcement to all other neighbors
-            self.forward_to_all_except(message, sender)
+                    threading.Thread(target=self.send_join, args=(group,), daemon=True).start()
+            
+            # if parent not yet assigned or if new parent is cheaper, update parent and forward 
+            print(f"Incoming ANNOUNCE advert from {sender} has cost of: {cost}")
+            if group not in self.parents or self.parents[group][1] > cost:
+                self.parents[group] = [sender, cost]
+                print(f"[Node {self.node_id}] Set Node {sender} as parent for group {group}")
+                if self.role == 'F':
+                    self.forward_to_all_except(message, sender)
 
         # Process JOIN (Building the forward routing table)
         elif msg_type == "JOIN":
@@ -112,7 +115,7 @@ class DynamicMulticastNode:
                 # Forward the JOIN up the tree towards the source
                 if self.role != 'S' and group in self.parents:
                     join_msg = {"type": "JOIN", "group": group, "sender": self.node_id}
-                    self.send_to_peer(self.parents[group], join_msg)
+                    self.send_to_peer(self.parents[group][0], join_msg)
 
         # Process DATA (Multicasting along the built tree)
         elif msg_type == "DATA":
@@ -122,25 +125,29 @@ class DynamicMulticastNode:
             if self.role == 'R':
                 print(f"*** Node {self.node_id} (Receiver) consumed DATA: {message.get('content')} ***")
             
-            # Forward to all next hops in the routing table 
-            if group in self.routing_table:
+            # Forward to all next hops in the routing table
+            elif group in self.routing_table:
                 forward_msg = message.copy()
                 forward_msg["sender"] = self.node_id
                 for hop in self.routing_table[group]:
                     self.send_to_peer(hop, forward_msg)
 
     def send_join(self, group):
+        time.sleep(1)
         parent = self.parents.get(group)
         if parent:
             join_msg = {"type": "JOIN", "group": group, "sender": self.node_id}
-            self.send_to_peer(parent, join_msg)
+            self.send_to_peer(parent[0], join_msg)
+            print(f"[NODE {self.node_id}] Sent JOIN msg to {self.parents.get(group)}")
 
     def forward_to_all_except(self, message, exclude_id):
         forward_msg = message.copy()
         forward_msg["sender"] = self.node_id
         for peer_id in self.peers:
             if peer_id != exclude_id:
+                forward_msg["cost"]+= self.peer_costs[peer_id]
                 self.send_to_peer(peer_id, forward_msg)
+                forward_msg["cost"]-= self.peer_costs[peer_id]
 
     def display_routing_table(self):
         print(f"\n--- Node {self.node_id} Routing Table ---")
@@ -162,7 +169,8 @@ class DynamicMulticastNode:
                 "msg_id": str(uuid.uuid4()),
                 "type": "ANNOUNCE",
                 "group": group,
-                "sender": self.node_id
+                "sender": self.node_id,
+                "cost": 0
             }
             self.seen_messages.add(announce_msg["msg_id"])
             self.forward_to_all_except(announce_msg, None)
